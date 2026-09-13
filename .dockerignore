@@ -1,0 +1,11 @@
+raw_data/
+data/
+results/
+results_v3/
+lora_output/
+.cache/
+.git/
+__pycache__/
+*.pyc
+.venv/
+venv/

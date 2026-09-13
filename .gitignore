@@ -1,0 +1,23 @@
+# Data & outputs - too large / personal for git, regenerate or re-upload instead
+raw_data/
+data/
+results/
+results_v3/
+lora_output/
+models/mannequin_keypoints/*.json
+!models/mannequin_keypoints/*_default.json   # keep the shipped sample defaults
+
+# Model caches
+.cache/
+**/.cache/huggingface/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.vscode/

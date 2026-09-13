@@ -1,0 +1,92 @@
+HUONG DAN CHAY VTON PIPELINE TREN RTX 5070 (NET)
+==================================================
+
+0. TRUOC KHI ROI NHA (tren may co code da sua)
+-----------------------------------------------
+cd vton_pipeline
+git init                                  (bo qua neu da la git repo)
+git add .
+git commit -m "vton pipeline - fixed"
+git branch -M main
+git remote add origin https://github.com/<user>/<repo>.git
+   (neu remote da ton tai: git remote set-url origin https://github.com/<user>/<repo>.git)
+git push -f origin main
+
+Luu y: raw_data/, data/, lora_output*/ khong nam trong git (.gitignore loai ra).
+Mang rieng qua USB/Google Drive.
+
+
+1. CLONE REPO VE MAY NET
+-------------------------
+git clone https://github.com/<user>/<repo>.git
+cd <repo>
+
+
+2. TAO VENV
+-----------
+python -m venv .venv
+.venv\Scripts\activate
+
+
+3. CAI PYTORCH DUNG BAN CHO RTX 5070 (Blackwell, sm_120, can torch >= 2.7)
+---------------------------------------------------------------------------
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+
+4. CAI THU VIEN CON LAI
+------------------------
+pip install -r requirements.txt
+pip install diffusers transformers accelerate peft rembg onnxruntime
+
+
+5. KIEM TRA GPU
+----------------
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+
+Phai thay: version >= 2.7, True, ten card la RTX 5070.
+Neu sai ten card / False -> dung lai kiem tra driver NVIDIA truoc khi lam tiep.
+
+
+6. COPY RAW_DATA VAO DUNG VI TRI
+----------------------------------
+Copy toan bo raw_data (tu USB/Drive) vao:
+<repo>\raw_data\sample_0001\...
+<repo>\raw_data\sample_0002\...
+...
+
+Kiem tra: dir raw_data  -> phai thay liet ke sample_0001, sample_0002, ...
+
+
+7. CHUAN BI DATASET (FULL 512PX)
+-----------------------------------
+python phase2_diffusion/prepare_dataset.py --raw_dir raw_data --out_dir data/train --image_size 512
+
+
+8. TRAIN FULL CONFIG (TAN DUNG 12GB VRAM)
+--------------------------------------------
+accelerate launch phase2_diffusion/train_lora.py `
+  --data_dir data/train --output_dir lora_output_final `
+  --resolution 512 --train_batch_size 4 --gradient_accumulation_steps 2 `
+  --no-gradient_checkpointing --lora_rank 16 --num_train_epochs 40 `
+  --learning_rate 1e-4 --save_every 5
+
+Neu OOM (bao "CUDA out of memory"): giam xuong
+  --train_batch_size 2 --gradient_accumulation_steps 4
+
+
+9. GENERATE THU
+-----------------
+python phase2_diffusion/generate.py `
+  --lora_path lora_output_final/final `
+  --mannequin_bare raw_data/sample_0001/mannequin_bare.jpg `
+  --mannequin_id female_default --garment_type top --sleeve_length short `
+  --garment raw_data/sample_0001/garment.png `
+  --n_variants 3 --out_dir results/
+
+(Khong can --low_vram tren 5070 - chi dung co do tren may 3050 Ti 4GB.)
+
+
+10. SAO CHEP KET QUA RA NGOAI NGAY - QUAN TRONG NHAT
+------------------------------------------------------
+Copy toan bo lora_output_final\ va results\ ra Google Drive/USB
+TRUOC KHI ROI MAY. May net thuong xoa du lieu giua cac phien thue.

@@ -1,0 +1,25 @@
+services:
+  vton:
+    build: .
+    image: vton-pipeline:local
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      # Persist these across container restarts / rebuilds, same role
+      # Google Drive played in the Colab notebook.
+      - ./raw_data:/app/raw_data
+      - ./data:/app/data
+      - ./lora_output:/app/lora_output
+      - ./results:/app/results
+      - ./models:/app/models
+      - hf_cache:/app/.cache/huggingface
+    stdin_open: true
+    tty: true
+
+volumes:
+  hf_cache:
