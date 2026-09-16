@@ -269,7 +269,11 @@ if __name__ == "__main__":
     parser.add_argument("--num_train_epochs", type=int, default=30)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--lora_rank", type=int, default=16)
-    parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
+    parser.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=True,
+                         help="Trade speed for VRAM by recomputing activations during backward instead "
+                              "of storing them. Needed on small-VRAM cards (e.g. 4GB laptop GPUs); on a "
+                              "16GB+ card you have VRAM to spare, so turn this OFF for a real speed-up: "
+                              "--no-gradient_checkpointing")
     parser.add_argument("--save_every", type=int, default=10)
     args = parser.parse_args()
     main(args)

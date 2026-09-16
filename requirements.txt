@@ -11,9 +11,14 @@ matplotlib
 # git+https://github.com/openai/CLIP.git
 # torch torchvision
 
-# --- Phase 2 (diffusion LoRA fine-tune) - install these for phase2_diffusion/ scripts ---
-# torch torchvision
-# diffusers>=0.40
-# transformers
-# accelerate
-# peft>=0.20
+# --- Phase 2 (diffusion LoRA fine-tune) - required for phase2_diffusion/ scripts ---
+# torch/torchvision are NOT listed here on purpose - the Docker base image
+# (pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime) already ships the correct
+# GPU-matched build. If installing into a plain venv instead of Docker, install
+# torch FIRST with the wheel matching your GPU (see LOCAL_AND_DOCKER.md), THEN
+# this file - otherwise pip may pull in a CPU-only or mismatched CUDA build.
+diffusers>=0.40
+transformers
+accelerate
+peft>=0.20
+safetensors
