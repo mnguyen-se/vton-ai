@@ -236,18 +236,19 @@ def main(args):
         print(f"Epoch {epoch+1}/{args.num_train_epochs} - avg loss: {epoch_loss/len(dataloader):.4f}")
 
         if (epoch + 1) % args.save_every == 0:
-            _save_lora(accelerator.unwrap_model(unet), args.output_dir, f"checkpoint-epoch{epoch+1}")
+            _save_lora(unet, args.output_dir, f"checkpoint-epoch{epoch+1}")
 
-    _save_lora(accelerator.unwrap_model(unet), args.output_dir, "final")
+    _save_lora(unet, args.output_dir, "final")
     print(f"Training complete. LoRA weights saved to {args.output_dir}")
 
 
 def _save_lora(unet, output_dir, name):
-    """Save LoRA weights, trying the newest API first and falling back for
-    older/newer peft+diffusers combinations (the exact method available
-    varies by version, which is what used to crash training at save time)."""
     save_path = os.path.join(output_dir, name)
     os.makedirs(save_path, exist_ok=True)
+    # unet.add_adapter() above injects LoRA via PEFT, so it must be saved
+    # with the matching PEFT-based save method. save_attn_procs() is a
+    # separate legacy path only valid for Custom Diffusion attention
+    # processors and will raise ValueError against a PEFT-injected model.
     if hasattr(unet, "save_lora_adapter"):
         unet.save_lora_adapter(save_path)
     elif hasattr(unet, "save_attn_procs"):

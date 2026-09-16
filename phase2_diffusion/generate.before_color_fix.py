@@ -51,20 +51,18 @@ from pipeline import pose_detect               # auto keypoint detection (defaul
 from pipeline import mannequin_pose            # manual calibration (fallback, top/bottom only)
 from pipeline.garment_analysis import classify_sleeve_length
 
-ITEM_KINDS = ("hat", "top", "bottom", "shoes", "dress")
+ITEM_KINDS = ("hat", "top", "bottom", "shoes")
 # Dressing order matters: each step's output becomes the next step's input,
 # so this is effectively the order you'd physically get dressed in - hat
 # last would visually cover hair/neckline oddly, shoes first would get
 # painted over by pants. Top-down, "inner layers first" order avoids that.
-# "dress" sits where "top" would - it's mutually exclusive with top/bottom
-# (enforced in dress_mannequin() below), never combined with them.
-DRESS_ORDER = ("hat", "dress", "top", "bottom", "shoes")
+DRESS_ORDER = ("hat", "top", "bottom", "shoes")
 
 # Same padding constants as prepare_dataset.py, so a box built here at
 # inference matches the geometry the model was actually trained on.
-_PAD_X_FRAC = {"hat": 0.15, "top": 0.30, "bottom": 0.30, "shoes": 0.15, "dress": 0.25}
-_PAD_Y_TOP_FRAC = {"hat": 0.10, "top": 0.08, "bottom": 0.05, "shoes": 0.05, "dress": 0.06}
-_PAD_Y_BOTTOM_FRAC = {"hat": 0.05, "top": 0.05, "bottom": 0.05, "shoes": 0.10, "dress": 0.05}
+_PAD_X_FRAC = {"hat": 0.15, "top": 0.30, "bottom": 0.30, "shoes": 0.15}
+_PAD_Y_TOP_FRAC = {"hat": 0.10, "top": 0.08, "bottom": 0.05, "shoes": 0.05}
+_PAD_Y_BOTTOM_FRAC = {"hat": 0.05, "top": 0.05, "bottom": 0.05, "shoes": 0.10}
 
 
 class PoseUnavailable(Exception):
@@ -86,7 +84,7 @@ def _get_fractional_keypoints(mannequin_bare: Image.Image, kind: str,
 
     reason = "no pose detected" if kp is None else f"low confidence ({kp.confidence:.2f})"
     if mannequin_id:
-        if kind not in ("top", "bottom", "dress"):
+        if kind not in ("top", "bottom"):
             raise PoseUnavailable(
                 f"Auto pose detection failed on this mannequin photo ({reason}), and manual "
                 f"calibration (--mannequin_id) only covers shoulders/hips/knees - it can't "
@@ -125,8 +123,6 @@ def build_mask_for_kind(kp, kind: str, image_size: tuple[int, int],
         x0, y0, x1, y1 = kp.lower_body_box(1) if is_manual else kp.lower_body_box()
     elif kind == "shoes":
         x0, y0, x1, y1 = kp.feet_box()
-    elif kind == "dress":
-        x0, y0, x1, y1 = kp.dress_box(1) if is_manual else kp.dress_box()
     else:
         raise ValueError(f"Unknown item kind: {kind}")
 
@@ -215,12 +211,6 @@ def dress_mannequin(pipe, mannequin_bare: Image.Image, items: dict[str, str | Im
     kinds = [k for k in DRESS_ORDER if items.get(k)]
     if not kinds:
         raise ValueError(f"items must include at least one of {ITEM_KINDS}")
-    if "dress" in kinds and ("top" in kinds or "bottom" in kinds):
-        raise ValueError(
-            "Can't combine 'dress' with 'top' or 'bottom' - a dress already covers the torso+leg "
-            "region, so pairing it with a separate top/bottom would paint two conflicting masks "
-            "over overlapping skin. Pick either a dress, or a top+bottom combo, not both."
-        )
 
     mannequin_bare = mannequin_bare.convert("RGB").resize((resolution, resolution))
     garment_images = {
@@ -311,9 +301,6 @@ if __name__ == "__main__":
     parser.add_argument("--top", default=None, help="Path to a top product photo")
     parser.add_argument("--bottom", default=None, help="Path to a bottom product photo")
     parser.add_argument("--shoes", default=None, help="Path to a shoes product photo")
-    parser.add_argument("--dress", default=None,
-                         help="Path to a one-piece dress product photo. Mutually exclusive with "
-                              "--top/--bottom (a dress already covers both regions).")
 
     # Legacy single-item mode (kept for backward compatibility):
     parser.add_argument("--garment_type", default=None, choices=list(ITEM_KINDS))

@@ -38,64 +38,71 @@ class BodyKeypoints:
     right_knee: tuple[float, float] | None = None
     neck: tuple[float, float] | None = None
 
-    def torso_box(self) -> tuple[int, int, int, int]:
-        """Bounding box for the torso region (for top garment placement).
-
-        NOTE: this box is bounded strictly by the shoulder/hip points, so it
-        does NOT cover the arms at all. Use torso_and_arms_box() instead when
-        the garment has sleeves (short or long), or the inpainting mask will
-        never include the arm area and the model will render a sleeveless
-        top regardless of the source garment photo.
+    def torso_box(self) -> tuple[float, float, float, float]:
+        """
+        Fractional (0-1) bounding box for the torso region (top garment).
+        NOTE: stays in the same 0-1 fractional space as the stored
+        keypoints - do NOT cast to int here. This object stores fractions
+        of the calibration photo's width/height (see to_pixels()), and an
+        int() cast here would truncate every coordinate to 0.
         """
         xs = [self.left_shoulder[0], self.right_shoulder[0], self.left_hip[0], self.right_hip[0]]
         ys = [self.left_shoulder[1], self.right_shoulder[1], self.left_hip[1], self.right_hip[1]]
-        return int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+        return min(xs), min(ys), max(xs), max(ys)
 
-    def torso_and_arms_box(self, sleeve_length: str = "short") -> tuple[int, int, int, int]:
-        """Bounding box for torso PLUS the arms, so sleeved garments have
-        room to be painted. We don't have elbow/wrist keypoints from manual
-        calibration (only shoulder/hip/knee), so the arm extent is estimated
-        from shoulder width and torso height:
-
-          - "none"  : same as torso_box() (tank top / sleeveless garment)
-          - "short" : widen box sideways to cover the upper arm/bicep
-                      and extend it down a bit past the shoulder line
-          - "long"  : widen further and extend down closer to where the
-                      wrist would be (roughly hip level)
-
-        This is an approximation, not a real arm mask - it's a rectangle
-        wide/tall enough that the diffusion inpainting has the pixels it
-        needs to draw a sleeve. Good enough for most mannequin poses with
-        arms held at/near the sides.
+    def lower_body_box(self, image_height: float = 1.0) -> tuple[float, float, float, float]:
         """
-        x0, y0, x1, y1 = self.torso_box()
-        shoulder_width = abs(self.right_shoulder[0] - self.left_shoulder[0])
-        torso_height = y1 - y0
-
-        if sleeve_length == "none":
-            return x0, y0, x1, y1
-
-        if sleeve_length == "short":
-            side_pad = shoulder_width * 0.45          # room for upper arm/bicep
-            bottom_y = y0 + torso_height * 0.75        # ends a bit above the elbow
-        else:  # "long"
-            side_pad = shoulder_width * 0.65
-            bottom_y = y1 + torso_height * 0.5          # reaches down toward the wrist
-
-        return (
-            int(x0 - side_pad),
-            int(y0),
-            int(x1 + side_pad),
-            int(bottom_y),
-        )
-
-    def lower_body_box(self, image_height: int) -> tuple[int, int, int, int]:
-        """Bounding box for hips-to-ankle region (for bottom garment placement)."""
+        Fractional (0-1) bounding box for hips-to-ankle region (bottom garment).
+        image_height: pass 1.0 (the default) to get a fractional box; only
+        pass an actual pixel height if you specifically want this one box
+        pre-scaled to pixels while everything else stays fractional (not
+        recommended - prefer scaling everything at once via to_pixels()).
+        No manual pixel padding is added here (the old hardcoded +-20px was
+        a pixel-space assumption that silently broke once coordinates
+        became fractional); callers add their own padding as a fraction of
+        box size, same as pose_detect.DetectedKeypoints.lower_body_box().
+        """
         xs = [self.left_hip[0], self.right_hip[0]]
-        ys_top = min(self.left_hip[1], self.right_hip[1])
-        x0, x1 = min(xs) - 20, max(xs) + 20
+        y0 = min(self.left_hip[1], self.right_hip[1])
         y1 = image_height * 0.98
-        return int(x0), int(ys_top), int(x1), int(y1)
+        return min(xs), y0, max(xs), y1
+
+    def dress_box(self, image_height: float = 1.0) -> tuple[float, float, float, float]:
+        """
+        Fractional (0-1) box for a one-piece dress: shoulders down to near
+        the bottom of frame. Manual calibration has no ankle point, so
+        this reuses the same 0.98*height floor lower_body_box() uses as an
+        approximation - good enough since a dress's own hem in the garment
+        photo determines how far down it actually gets painted anyway.
+        """
+        xs = [self.left_shoulder[0], self.right_shoulder[0], self.left_hip[0], self.right_hip[0]]
+        y0 = min(self.left_shoulder[1], self.right_shoulder[1])
+        y1 = image_height * 0.98
+        return min(xs), y0, max(xs), y1
+
+    def to_pixels(self, image_width: int, image_height: int) -> "BodyKeypoints":
+        """
+        Rescale keypoints stored as fractions of the calibration photo's
+        width/height (0.0-1.0) into absolute pixel coordinates for a given
+        (possibly different-resolution) image of the SAME mannequin/crop.
+        This is what makes keypoints calibrated once reusable at inference
+        even when the mannequin photo you feed to generate.py isn't the
+        exact same pixel dimensions as the one you clicked on in Cell 4.
+        """
+        def scale(pt):
+            if pt is None:
+                return None
+            return (pt[0] * image_width, pt[1] * image_height)
+
+        return BodyKeypoints(
+            left_shoulder=scale(self.left_shoulder),
+            right_shoulder=scale(self.right_shoulder),
+            left_hip=scale(self.left_hip),
+            right_hip=scale(self.right_hip),
+            left_knee=scale(self.left_knee),
+            right_knee=scale(self.right_knee),
+            neck=scale(self.neck),
+        )
 
 
 # ---------- MANUAL calibration (recommended default) ----------

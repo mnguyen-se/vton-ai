@@ -3,76 +3,111 @@ prepare_dataset.py (Phase 2)
 ------------------------------
 Builds the training set for LoRA fine-tuning of the diffusion VTON model.
 
-Each training sample needs THREE things:
-  1. target.jpg     - ground truth: mannequin ALREADY wearing the garment
-                       (this is what the model learns to generate)
-  2. masked.jpg      - the same mannequin WITHOUT that garment (bare, or
-                        wearing something else) - what the model paints INTO
-  3. mask.png        - binary mask of the region that gets repainted
-                        (torso for tops, legs for bottoms)
-  4. garment.jpg     - the flat/product photo of the garment (conditioning
-                        signal fed through IP-Adapter)
+--- v2: pose-detected masking, no "bare" reference photo required ---
+The original version built the inpaint mask by pixel-diffing
+mannequin_bare.jpg against mannequin_wearing.jpg. That ONLY works if both
+photos are the exact same mannequin/pose/camera/crop - a real before/after
+pair. Real-world data (product photos pulled from different listings/shops)
+almost never satisfies that even when you reuse one generic "bare" photo
+across samples: different aspect ratios, poses, crops, even different
+mannequins/models entirely. Diffing unrelated photos produces garbage masks
+and - worse - trains the model on (masked_input, target) pairs that don't
+actually correspond to the same scene, which teaches it to hallucinate
+mismatched bodies (this is what produced the bloated-mannequin-with-human-feet
+and floating-garment-on-blank-background failures).
 
-WHERE DOES THIS DATA COME FROM?
-Realistically you have two sources, use both:
-  A. Real photos you already have or shoot: mannequin bare + mannequin
-     wearing a real garment = perfect (target, masked) pair for that garment.
-  B. Bootstrap using Phase 1 (baseline TPS pipeline): run the baseline
-     pipeline to paste garments onto mannequins -> these become rough
-     "target" images. They won't be photorealistic, but they still teach
-     the model garment identity / rough placement, and mixing in even a
-     small number of real photos (source A) teaches it realism. This is
-     the standard trick when real paired data is scarce.
+New approach: detect body keypoints DIRECTLY on each mannequin_wearing photo
+(via MediaPipe Pose, see pipeline/pose_detect.py), build the mask from that,
+and build the "masked" training input by blanking the mask region OUT OF
+THE SAME WEARING PHOTO (not a different bare photo). This is the standard
+scheme for fine-tuning inpainting models and requires no matched pair at
+all - mannequin_bare.jpg is no longer used at training time (only needed
+later, at inference, as the actual photo you want to dress).
 
 Folder layout expected as INPUT to this script:
   raw_data/
     sample_0001/
-      mannequin_bare.jpg
-      mannequin_wearing.jpg
-      garment.jpg
-      body_region.json     # optional: {"box": [x0,y0,x1,y1]}, else auto from keypoints
+      mannequin_wearing.jpg        # required - the only photo actually used
+      garment.jpg                  # single-garment sample (treated as "top"), OR any of:
+      garment_hat.jpg              # sample shows a hat worn
+      garment_top.jpg              # sample shows a top worn
+      garment_bottom.jpg           # sample shows a bottom worn
+      garment_shoes.jpg            # sample shows shoes worn
+      mannequin_bare.jpg           # optional, ignored here (kept for inference use)
+      body_region.json             # optional manual override, see below
     sample_0002/
       ...
+
+A sample can include ANY COMBINATION of hat/top/bottom/shoes (1 to 4 of
+them) as long as mannequin_wearing.jpg actually shows the mannequin wearing
+each one included - you do NOT need every sample to have all 4 items.
+One training example is written per item present in the sample.
+
+body_region.json (optional, only if auto pose-detection fails/misfires for
+a given photo): {"box_<kind>": [x0, y0, x1, y1]} as FRACTIONS (0.0-1.0) of
+the ORIGINAL wearing photo's width/height, one key per item kind present
+("box_hat", "box_top", "box_bottom", "box_shoes"). For a legacy single
+"garment.jpg" sample, use {"box": [...]}.
 
 Produces OUTPUT in `data/train/` ready for train_lora.py.
 """
 import argparse
 import json
 import os
-import shutil
 import sys
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from pipeline import segmentation  # reuse Phase 1's background removal for the mask fallback
+from pipeline import segmentation   # Phase 1's background remover, reused for garment conditioning image
+from pipeline import pose_detect    # MediaPipe-based auto keypoint detection (this fix's core piece)
+
+_EXTS = (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG")
+ITEM_KINDS = ("hat", "top", "bottom", "shoes", "dress")
+# A dress covers what top+bottom would separately cover - mutually
+# exclusive with them (see process_sample below), never combined.
+_MUTUALLY_EXCLUSIVE = {"dress": ("top", "bottom"), "top": ("dress",), "bottom": ("dress",)}
+
+# How far to pad the raw keypoint box, as a fraction of box width/height.
+# Single fixed value (unlike generate.py's sleeve-aware padding) because the
+# dataset should teach the model a range of sleeve/hem lengths across many
+# samples - it doesn't need to be exact per-sample. Hats and shoes get their
+# own (smaller) padding since head_box/feet_box are already sized to the
+# item's natural footprint, not a coarse torso-scale estimate.
+_PAD_X_FRAC = {"hat": 0.15, "top": 0.30, "bottom": 0.30, "shoes": 0.15, "dress": 0.25}
+_PAD_Y_TOP_FRAC = {"hat": 0.10, "top": 0.08, "bottom": 0.05, "shoes": 0.05, "dress": 0.06}
+_PAD_Y_BOTTOM_FRAC = {"hat": 0.05, "top": 0.05, "bottom": 0.05, "shoes": 0.10, "dress": 0.05}
 
 
-def make_mask_from_box(box, size) -> Image.Image:
-    x0, y0, x1, y1 = box
-    mask = Image.new("L", size, 0)
-    from PIL import ImageDraw
-    draw = ImageDraw.Draw(mask)
-    draw.rectangle([x0, y0, x1, y1], fill=255)
-    return mask
+def _find_file(sample_dir: str, base_name: str) -> str | None:
+    """Return the first existing path for base_name with any of _EXTS, or None."""
+    for ext in _EXTS:
+        p = os.path.join(sample_dir, base_name + ext)
+        if os.path.exists(p):
+            return p
+    return None
 
 
-def make_mask_from_diff(bare: Image.Image, wearing: Image.Image, threshold: int = 30) -> Image.Image:
+def letterbox(img: Image.Image, size: int, fill=(255, 255, 255)):
     """
-    Fallback: if no body_region.json given, estimate the mask as the region
-    that visibly changed between bare and wearing mannequin photos.
-    Works best when the two photos are pixel-aligned (same camera position).
+    Resize preserving aspect ratio, padding to a size x size square instead
+    of stretching. Stretching a 1792x2400 portrait product photo and a
+    987x1024 near-square photo to the same 512x512 square (the old
+    behavior) distorts body proportions by a DIFFERENT amount per sample -
+    this is a big part of why generated bodies came out bloated/warped.
+    Returns (canvas, scale, pad_x, pad_y) - the transform is only needed if
+    you must map coordinates from the ORIGINAL image into canvas space;
+    here we instead run pose detection straight on the canvas, so callers
+    that don't have pre-existing original-space coordinates can ignore them.
     """
-    a = np.array(bare.convert("RGB")).astype(np.int16)
-    b = np.array(wearing.convert("RGB")).astype(np.int16)
-    diff = np.abs(a - b).sum(axis=-1)
-    mask = (diff > threshold).astype(np.uint8) * 255
-
-    # clean up: dilate a bit so edges are fully covered
-    import cv2
-    kernel = np.ones((15, 15), np.uint8)
-    mask = cv2.dilate(mask, kernel, iterations=1)
-    return Image.fromarray(mask, mode="L")
+    w, h = img.size
+    scale = size / max(w, h)
+    new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+    canvas = Image.new("RGB", (size, size), fill)
+    pad_x, pad_y = (size - new_w) // 2, (size - new_h) // 2
+    canvas.paste(resized, (pad_x, pad_y))
+    return canvas, scale, pad_x, pad_y
 
 
 def clean_garment(garment_path: str, image_size: int) -> Image.Image:
@@ -85,102 +120,136 @@ def clean_garment(garment_path: str, image_size: int) -> Image.Image:
     return garment_clean.resize((image_size, image_size))
 
 
-def split_mask_top_bottom(mask: Image.Image, waist_frac: float = 0.55):
-    """
-    Split a full diff mask into a "top" half (torso/shirt region) and a
-    "bottom" half (legs/pants region) using an approximate waist line.
-    Used for combo photos where both a top and a bottom changed at once,
-    so a single diff mask would otherwise cover both garments.
-    """
-    w, h = mask.size
-    split_y = int(h * waist_frac)
-
-    arr = np.array(mask)
-    top_arr = arr.copy()
-    top_arr[split_y:, :] = 0
-    bottom_arr = arr.copy()
-    bottom_arr[:split_y, :] = 0
-
-    return Image.fromarray(top_arr, mode="L"), Image.fromarray(bottom_arr, mode="L")
+def _pad_box(box_frac: tuple[float, float, float, float], size: int, kind: str) -> tuple[int, int, int, int]:
+    """Turn a fractional (x0,y0,x1,y1) box into a padded pixel box on a size x size canvas."""
+    x0, y0, x1, y1 = [v * size for v in box_frac]
+    w, h = x1 - x0, y1 - y0
+    x0 -= w * _PAD_X_FRAC[kind]
+    x1 += w * _PAD_X_FRAC[kind]
+    y0 -= h * _PAD_Y_TOP_FRAC[kind]
+    y1 += h * _PAD_Y_BOTTOM_FRAC[kind]
+    x0, y0 = max(0, int(x0)), max(0, int(y0))
+    x1, y1 = min(size, int(x1)), min(size, int(y1))
+    if x1 <= x0:
+        x0, x1 = max(0, x0 - 1), min(size, x0 + 1)
+    if y1 <= y0:
+        y0, y1 = max(0, y0 - 1), min(size, y0 + 1)
+    return x0, y0, x1, y1
 
 
-def _write_example(out_dir: str, example_id: str, wearing: Image.Image, bare: Image.Image,
+def _box_for_kind(kp, kind: str) -> tuple[float, float, float, float]:
+    return {
+        "hat": kp.head_box,
+        "top": kp.torso_box,
+        "bottom": kp.lower_body_box,
+        "shoes": kp.feet_box,
+        "dress": kp.dress_box,
+    }[kind]()
+
+
+def _mask_and_masked(wearing: Image.Image, box: tuple[int, int, int, int], image_size: int):
+    mask = Image.new("L", (image_size, image_size), 0)
+    ImageDraw.Draw(mask).rectangle(list(box), fill=255)
+
+    # Standard SD-inpainting training convention: masked_image = image with
+    # the masked region zeroed out (this matches what
+    # StableDiffusionInpaintPipeline does internally at inference, so
+    # training sees the same kind of input it will get at inference time).
+    wearing_arr = np.array(wearing)
+    mask_arr = np.array(mask)
+    masked_arr = wearing_arr.copy()
+    masked_arr[mask_arr > 127] = 0
+    masked = Image.fromarray(masked_arr, mode="RGB")
+    return mask, masked
+
+
+def _write_example(out_dir: str, example_id: str, target: Image.Image, masked: Image.Image,
                     mask: Image.Image, garment_clean: Image.Image):
     out = os.path.join(out_dir, example_id)
     os.makedirs(out, exist_ok=True)
-    wearing.save(os.path.join(out, "target.jpg"), quality=95)
-    bare.save(os.path.join(out, "masked.jpg"), quality=95)
+    target.save(os.path.join(out, "target.jpg"), quality=95)
+    masked.save(os.path.join(out, "masked.jpg"), quality=95)
     mask.save(os.path.join(out, "mask.png"))
     garment_clean.save(os.path.join(out, "garment.jpg"), quality=95)
 
 
-_IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
-
-
-def _find_image(sample_dir: str, basename: str) -> str | None:
-    """Look for <basename>.<ext> under any of the common image extensions,
-    so raw_data samples work whether their photos are .jpg or .png (mixed
-    extensions from different phone/export sources used to make this script
-    silently skip whole samples)."""
-    for ext in _IMG_EXTS:
-        p = os.path.join(sample_dir, basename + ext)
-        if os.path.exists(p):
-            return p
-    return None
-
-
-def process_sample(sample_dir: str, out_dir: str, sample_id: str, image_size: int = 512):
-    bare_path = _find_image(sample_dir, "mannequin_bare")
-    wearing_path = _find_image(sample_dir, "mannequin_wearing")
-    region_path = os.path.join(sample_dir, "body_region.json")
-
-    garment_path = _find_image(sample_dir, "garment")
-    garment_top_path = _find_image(sample_dir, "garment_top")
-    garment_bottom_path = _find_image(sample_dir, "garment_bottom")
-
-    if not (bare_path and wearing_path):
-        print(f"[skip] {sample_dir}: missing mannequin_bare.* / mannequin_wearing.* "
-              f"(looked for {_IMG_EXTS})")
+def process_sample(sample_dir: str, out_dir: str, sample_id: str, image_size: int = 512,
+                    min_confidence: float = 0.3) -> bool:
+    wearing_path = _find_file(sample_dir, "mannequin_wearing")
+    if not wearing_path:
+        print(f"[skip] {sample_dir}: missing mannequin_wearing (any of {_EXTS})")
         return False
 
-    bare = Image.open(bare_path).convert("RGB").resize((image_size, image_size))
-    wearing = Image.open(wearing_path).convert("RGB").resize((image_size, image_size))
+    garment_path = _find_file(sample_dir, "garment")  # legacy single-item naming, always "top"
+    item_paths = {kind: _find_file(sample_dir, f"garment_{kind}") for kind in ITEM_KINDS}
+    has_named_items = any(item_paths.values())
 
-    has_combo = bool(garment_top_path or garment_bottom_path)
+    if not has_named_items and not garment_path:
+        print(f"[skip] {sample_dir}: no garment files found "
+              f"(expected garment.jpg or garment_hat/top/bottom/shoes/dress.*)")
+        return False
 
-    if has_combo:
-        # Combo sample: photo shows the mannequin wearing TWO garments at
-        # once (e.g. a top + a bottom). Produce one training example per
-        # garment, each using only its half of the diff mask so the model
-        # doesn't learn to paint the other garment too.
-        full_mask = make_mask_from_diff(bare, wearing)
-        top_mask, bottom_mask = split_mask_top_bottom(full_mask)
+    if item_paths["dress"] and (item_paths["top"] or item_paths["bottom"]):
+        print(f"[skip] {sample_dir}: has both garment_dress and garment_top/bottom - a dress "
+              f"already covers the torso+leg region, combining it with a separate top/bottom "
+              f"would give two conflicting masks for overlapping skin. Split into two samples instead.")
+        return False
 
+    wearing_raw = Image.open(wearing_path).convert("RGB")
+    wearing, _, _, _ = letterbox(wearing_raw, image_size)
+
+    region_path = os.path.join(sample_dir, "body_region.json")
+    manual = None
+    if os.path.exists(region_path):
+        with open(region_path) as f:
+            manual = json.load(f)
+
+    _kp_cache = {}
+
+    def get_box(kind: str):
+        """Prefers a manual body_region.json override, else auto pose detection (cached per sample)."""
+        if manual is not None:
+            key = f"box_{kind}" if has_named_items else "box"
+            if key in manual:
+                return _pad_box(tuple(manual[key]), image_size, kind)
+
+        if "kp" not in _kp_cache:
+            _kp_cache["kp"] = pose_detect.detect_keypoints(wearing)
+        kp = _kp_cache["kp"]
+        if kp is None:
+            print(f"[skip] {sample_dir} ({kind}): no pose detected in mannequin_wearing "
+                  f"(headless/ghost-mannequin photo, extreme crop, or occlusion). "
+                  f"Add a body_region.json override to use this sample.")
+            return None
+        if kp.confidence < min_confidence:
+            print(f"[skip] {sample_dir} ({kind}): pose detection confidence too low "
+                  f"({kp.confidence:.2f} < {min_confidence}) - box would likely be unreliable. "
+                  f"Add a body_region.json override to use this sample anyway.")
+            return None
+        return _pad_box(_box_for_kind(kp, kind), image_size, kind)
+
+    if has_named_items:
         wrote_any = False
-        if garment_top_path:
-            garment_clean = clean_garment(garment_top_path, image_size)
-            _write_example(out_dir, f"{sample_id}_top", wearing, bare, top_mask, garment_clean)
-            wrote_any = True
-        if garment_bottom_path:
-            garment_clean = clean_garment(garment_bottom_path, image_size)
-            _write_example(out_dir, f"{sample_id}_bottom", wearing, bare, bottom_mask, garment_clean)
+        for kind in ITEM_KINDS:
+            path = item_paths[kind]
+            if not path:
+                continue
+            box = get_box(kind)
+            if not box:
+                continue
+            mask, masked = _mask_and_masked(wearing, box, image_size)
+            garment_clean = clean_garment(path, image_size)
+            _write_example(out_dir, f"{sample_id}_{kind}", wearing, masked, mask, garment_clean)
             wrote_any = True
         return wrote_any
 
-    if not garment_path:
-        print(f"[skip] {sample_dir}: missing garment.* (or garment_top.*/garment_bottom.*)")
+    # Legacy path: a single unlabeled "garment.jpg" is always treated as a top.
+    box = get_box("top")
+    if not box:
         return False
-
+    mask, masked = _mask_and_masked(wearing, box, image_size)
     garment_clean = clean_garment(garment_path, image_size)
-
-    if os.path.exists(region_path):
-        with open(region_path) as f:
-            box = json.load(f)["box"]
-        mask = make_mask_from_box(box, (image_size, image_size))
-    else:
-        mask = make_mask_from_diff(bare, wearing)
-
-    _write_example(out_dir, sample_id, wearing, bare, mask, garment_clean)
+    _write_example(out_dir, sample_id, wearing, masked, mask, garment_clean)
     return True
 
 
@@ -192,11 +261,13 @@ def main(args):
         sample_dir = os.path.join(args.raw_dir, s)
         if not os.path.isdir(sample_dir):
             continue
-        success = process_sample(sample_dir, args.out_dir, s, args.image_size)
+        success = process_sample(sample_dir, args.out_dir, s, args.image_size, args.min_confidence)
         ok += int(success)
         skipped += int(not success)
 
     print(f"Done. {ok} samples prepared, {skipped} skipped -> {args.out_dir}")
+    if skipped:
+        print(f"({skipped} skipped - see [skip] lines above for why each one was excluded)")
 
 
 if __name__ == "__main__":
@@ -204,5 +275,9 @@ if __name__ == "__main__":
     parser.add_argument("--raw_dir", default="raw_data")
     parser.add_argument("--out_dir", default="data/train")
     parser.add_argument("--image_size", type=int, default=512)
+    parser.add_argument("--min_confidence", type=float, default=0.3,
+                         help="Minimum mean MediaPipe landmark visibility to trust the auto-detected "
+                              "pose box. Lower this if too many real samples get skipped; raise it if "
+                              "you're seeing bad boxes get through.")
     args = parser.parse_args()
     main(args)

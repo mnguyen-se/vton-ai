@@ -1,16 +1,32 @@
-HUONG DAN CHAY VTON PIPELINE TREN RTX 5070 (NET)
-==================================================
+HUONG DAN CHAY VTON PIPELINE TREN RTX 5070 (NET) - BAN CAP NHAT
+==================================================================
+(thay the ban HUONG_DAN_NET_5070.txt cu - da doi nhieu so voi ban cu)
+
+NHUNG GI DA THAY DOI SO VOI BAN CU, CAN BIET TRUOC:
+------------------------------------------------------
+- KHONG CAN calibrate tay / --mannequin_id nua. generate.py gio TU DONG
+  detect pose (vai/hong/goi/dau/chan) ngay tren anh mannequin_bare, dung
+  chung 1 co che voi luc chuan bi dataset. --mannequin_id chi con la
+  phuong an du phong (chi ho tro top/bottom, khong ho tro hat/shoes/dress).
+- THEM 3 LOAI ITEM MOI: hat (mu), shoes (giay), dress (vay lien). Tong
+  cong gio la 5 loai: hat, top, bottom, shoes, dress.
+- CO CHE MAC NHIEU MON CUNG LUC: generate.py gio nhan --hat/--top/--bottom
+  /--shoes/--dress (chon bao nhieu tuy y, tru dress khong duoc di cung
+  top/bottom) va tu dong mac tuan tu tat ca trong 1 lan goi.
+- requirements.txt DA CO SAN diffusers/transformers/accelerate/peft - KHONG
+  CAN pip install rieng nhu ban cu nua (do thua, khong hai nhung khong can).
+- --no-gradient_checkpointing gio MOI THUC SU HOAT DONG (ban cu bi bug
+  argparse, flag nay truoc day khong co tac dung du co ghi trong lenh).
+- prepare_dataset.py gio TU TAI 1 model pose (~30MB tu Google) o lan chay
+  dau tien - CAN INTERNET luc do, chi tai 1 lan roi cache lai.
+
 
 0. TRUOC KHI ROI NHA (tren may co code da sua)
 -----------------------------------------------
 cd vton_pipeline
-git init                                  (bo qua neu da la git repo)
 git add .
-git commit -m "vton pipeline - fixed"
-git branch -M main
-git remote add origin https://github.com/<user>/<repo>.git
-   (neu remote da ton tai: git remote set-url origin https://github.com/<user>/<repo>.git)
-git push -f origin main
+git commit -m "vton pipeline v2 - 5 item categories, auto pose-detect"
+git push origin main
 
 Luu y: raw_data/, data/, lora_output*/ khong nam trong git (.gitignore loai ra).
 Mang rieng qua USB/Google Drive.
@@ -33,10 +49,9 @@ python -m venv .venv
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 
-4. CAI THU VIEN CON LAI
-------------------------
+4. CAI THU VIEN CON LAI (gio chi 1 dong duy nhat)
+----------------------------------------------------
 pip install -r requirements.txt
-pip install diffusers transformers accelerate peft rembg onnxruntime
 
 
 5. KIEM TRA GPU
@@ -54,6 +69,12 @@ Copy toan bo raw_data (tu USB/Drive) vao:
 <repo>\raw_data\sample_0002\...
 ...
 
+Moi sample co the co BAT KY to hop nao trong 5 loai:
+  garment_hat.*, garment_top.*, garment_bottom.*, garment_shoes.*, garment_dress.*
+(khong bat buoc du ca 5 - 1 sample chi co garment_hat la van hop le)
+LUU Y: garment_dress KHONG duoc di kem garment_top/garment_bottom trong
+cung 1 sample (se bi tu dong skip, xem ly do trong log [skip]).
+
 Kiem tra: dir raw_data  -> phai thay liet ke sample_0001, sample_0002, ...
 
 
@@ -61,29 +82,44 @@ Kiem tra: dir raw_data  -> phai thay liet ke sample_0001, sample_0002, ...
 -----------------------------------
 python phase2_diffusion/prepare_dataset.py --raw_dir raw_data --out_dir data/train --image_size 512
 
+Lan dau chay se in dong "[pose_detect] Downloading pose model..." - can
+internet, doi vai giay. Doc ky cac dong [skip] (neu co) de biet sample nao
+bi loai va vi sao truoc khi train.
 
-8. TRAIN FULL CONFIG (TAN DUNG 12GB VRAM)
---------------------------------------------
+
+8. TRAIN FULL CONFIG (TAN DUNG 12GB VRAM CUA 5070)
+--------------------------------------------------------------
 accelerate launch phase2_diffusion/train_lora.py `
   --data_dir data/train --output_dir lora_output_final `
-  --resolution 512 --train_batch_size 4 --gradient_accumulation_steps 2 `
-  --no-gradient_checkpointing --lora_rank 16 --num_train_epochs 40 `
+  --resolution 512 --train_batch_size 6 --gradient_accumulation_steps 1 `
+  --no-gradient_checkpointing --lora_rank 32 --num_train_epochs 40 `
   --learning_rate 1e-4 --save_every 5
 
-Neu OOM (bao "CUDA out of memory"): giam xuong
-  --train_batch_size 2 --gradient_accumulation_steps 4
+Neu OOM (bao "CUDA out of memory"): giam dan theo thu tu nay
+  1) --train_batch_size 4
+  2) bo --no-gradient_checkpointing (de mac dinh bat lai)
+  3) --lora_rank 16
 
 
-9. GENERATE THU
------------------
+9. GENERATE THU - MAC NHIEU MON CUNG LUC (CACH MOI)
+--------------------------------------------------------
 python phase2_diffusion/generate.py `
   --lora_path lora_output_final/final `
   --mannequin_bare raw_data/sample_0001/mannequin_bare.jpg `
-  --mannequin_id female_default --garment_type top --sleeve_length short `
-  --garment raw_data/sample_0001/garment.png `
+  --top raw_data/sample_0001/garment_top.png `
+  --bottom raw_data/sample_0001/garment_bottom.png `
+  --sleeve_length auto `
   --n_variants 3 --out_dir results/
 
-(Khong can --low_vram tren 5070 - chi dung co do tren may 3050 Ti 4GB.)
+(KHONG can --mannequin_id nua - tu dong detect. Neu muon test rieng 1 mon,
+chi dien dung 1 trong --hat/--top/--bottom/--shoes/--dress la du.)
+
+Vi du mac du hat+top+bottom+shoes trong 1 lan:
+python phase2_diffusion/generate.py `
+  --lora_path lora_output_final/final `
+  --mannequin_bare raw_data/sample_0001/mannequin_bare.jpg `
+  --hat item/cap.jpg --top item/shirt.jpg --bottom item/jeans.jpg --shoes item/sneaker.jpg `
+  --n_variants 3 --out_dir results_full/
 
 
 10. SAO CHEP KET QUA RA NGOAI NGAY - QUAN TRONG NHAT
